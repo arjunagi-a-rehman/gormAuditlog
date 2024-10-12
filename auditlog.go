@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"time"
 
+	"strings"
+
 	"gorm.io/gorm"
 )
 
@@ -17,7 +19,7 @@ type AuditLog struct {
 	Action       string    `gorm:"index"`
 	Timestamp    time.Time `gorm:"index"`
 	CurrentValue string    `gorm:"type:text"`
-	ChangedBy    string    `gorm:"index"`
+	PerformedBy    string    `gorm:"index"`
 }
 
 // AuditLogger is a struct that holds the database connection and tracked tables
@@ -51,44 +53,7 @@ func NewAuditLogger(db *gorm.DB, tables []string) (*AuditLogger, error) {
 
 // CreateAuditLogTable creates the audit_logs table
 func (al *AuditLogger) CreateAuditLogTable() error {
-	var sql string
-	if al.DBType == "mysql" {
-		sql = `
-			CREATE TABLE IF NOT EXISTS audit_logs (
-				id INT AUTO_INCREMENT PRIMARY KEY,
-				record_id INT,
-				table_name VARCHAR(255),
-				action VARCHAR(50),
-				timestamp DATETIME,
-				current_value TEXT,
-				changed_by VARCHAR(255),
-				INDEX idx_audit_logs_record_id (record_id),
-				INDEX idx_audit_logs_table_name (table_name),
-				INDEX idx_audit_logs_action (action),
-				INDEX idx_audit_logs_timestamp (timestamp),
-				INDEX idx_audit_logs_changed_by (changed_by)
-			);
-		`
-	} else if al.DBType == "postgres" {
-		sql = `
-			CREATE TABLE IF NOT EXISTS audit_logs (
-				id SERIAL PRIMARY KEY,
-				record_id INTEGER,
-				table_name VARCHAR(255),
-				action VARCHAR(50),
-				timestamp TIMESTAMP,
-				current_value TEXT,
-				changed_by VARCHAR(255)
-			);
-			CREATE INDEX IF NOT EXISTS idx_audit_logs_record_id ON audit_logs(record_id);
-			CREATE INDEX IF NOT EXISTS idx_audit_logs_table_name ON audit_logs(table_name);
-			CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
-			CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp);
-			CREATE INDEX IF NOT EXISTS idx_audit_logs_changed_by ON audit_logs(changed_by);
-		`
-	}
-
-	return al.DB.Exec(sql).Error
+	return al.DB.AutoMigrate(&AuditLog{})
 }
 
 // CreateTriggers creates database triggers for the tracked tables
@@ -117,7 +82,7 @@ func (al *AuditLogger) createMySQLTriggers(tableName string) error {
 			%s %s ON %s
 			FOR EACH ROW
 			BEGIN
-				INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, changed_by)
+				INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
 				VALUES (
 					CASE WHEN '%s' = 'DELETE' THEN OLD.id ELSE NEW.id END,
 					'%s',
@@ -128,7 +93,7 @@ func (al *AuditLogger) createMySQLTriggers(tableName string) error {
 						WHEN '%s' = 'UPDATE' THEN JSON_OBJECT('old', OLD, 'new', NEW)
 						ELSE JSON_OBJECT('new', NEW)
 					END,
-					IFNULL(@changed_by, 'system')
+					IFNULL(@performed_by, 'system')
 				);
 			END;
 		`, triggerName, timing, event, tableName, event, tableName, event, event, event)
@@ -152,10 +117,22 @@ func (al *AuditLogger) createMySQLTriggers(tableName string) error {
 func (al *AuditLogger) createPostgresTriggers(tableName string) error {
 	sql := fmt.Sprintf(`
 		CREATE OR REPLACE FUNCTION %s_audit() RETURNS TRIGGER AS $$
+		DECLARE
+			audit_performed_by TEXT;
+			record_id TEXT;
 		BEGIN
-			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, changed_by)
+			-- Try to get the performed_by value, default to 'system' if not set
+			audit_performed_by := COALESCE(current_setting('audit.performed_by', true), 'system');
+
+			IF (TG_OP = 'DELETE') THEN
+				record_id := OLD.id::text;
+			ELSE
+				record_id := NEW.id::text;
+			END IF;
+
+			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
 			VALUES (
-				CASE WHEN TG_OP = 'DELETE' THEN OLD.id ELSE NEW.id END,
+				record_id,
 				TG_TABLE_NAME,
 				TG_OP,
 				NOW(),
@@ -164,27 +141,17 @@ func (al *AuditLogger) createPostgresTriggers(tableName string) error {
 					WHEN TG_OP = 'UPDATE' THEN json_build_object('old', row_to_json(OLD), 'new', row_to_json(NEW))::text
 					ELSE row_to_json(NEW)::text
 				END,
-				COALESCE(current_setting('audit.changed_by', true), 'system')
+				audit_performed_by
 			);
 			RETURN NULL;
 		END;
 		$$ LANGUAGE plpgsql;
 
-		DROP TRIGGER IF EXISTS %s_insert_trigger ON %s;
-		CREATE TRIGGER %s_insert_trigger
-		AFTER INSERT ON %s
+		DROP TRIGGER IF EXISTS %s_audit_trigger ON %s;
+		CREATE TRIGGER %s_audit_trigger
+		AFTER INSERT OR UPDATE OR DELETE ON %s
 		FOR EACH ROW EXECUTE FUNCTION %s_audit();
-
-		DROP TRIGGER IF EXISTS %s_update_trigger ON %s;
-		CREATE TRIGGER %s_update_trigger
-		AFTER UPDATE ON %s
-		FOR EACH ROW EXECUTE FUNCTION %s_audit();
-
-		DROP TRIGGER IF EXISTS %s_delete_trigger ON %s;
-		CREATE TRIGGER %s_delete_trigger
-		AFTER DELETE ON %s
-		FOR EACH ROW EXECUTE FUNCTION %s_audit();
-	`, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName, tableName)
+	`, tableName, tableName, tableName, tableName, tableName, tableName)
 
 	return al.DB.Exec(sql).Error
 }
@@ -214,51 +181,84 @@ func (al *AuditLogger) logSingleRecord(tx *gorm.DB, record interface{}, tableNam
 	currentValues, _ := json.Marshal(record)
 
 	pkValue := getPrimaryKeyValue(tx, record)
-	var recordID string
-	if pkValue != nil {
-		recordID = fmt.Sprintf("%v", pkValue) // Convert any type to string
-	}
+	recordID := fmt.Sprintf("%v", pkValue)
+	action := getAction(tx)
 
 	auditLog := AuditLog{
 		RecordID:     recordID,
 		TableName:    tableName,
-		Action:       getAction(tx),
+		Action:       action,
 		Timestamp:    time.Now(),
 		CurrentValue: string(currentValues),
-		ChangedBy:    getChangedBy(tx),
+		PerformedBy:    getPerformedBy(tx),
 	}
 
-	al.DB.Create(&auditLog)
+	result := al.DB.Create(&auditLog)
+	if result.Error != nil {
+		fmt.Printf("Error creating audit log: %v\n", result.Error)
+	}
 }
 
 func getPrimaryKeyValue(tx *gorm.DB, record interface{}) interface{} {
 	if field := tx.Statement.Schema.PrioritizedPrimaryField; field != nil {
-		value, isZero := field.ValueOf(tx.Statement.Context, reflect.ValueOf(record))
-		if !isZero {
-			return value
-		}
+		value, _ := field.ValueOf(tx.Statement.Context, reflect.ValueOf(record))
+		return value
 	}
 	return nil
 }
 
 func getAction(tx *gorm.DB) string {
+	if tx.Statement.Schema == nil {
+		return "UNKNOWN"
+	}
+
+	if tx.Statement.SQL.String() != "" && strings.HasPrefix(strings.ToUpper(tx.Statement.SQL.String()), "INSERT") {
+		return "INSERT"
+	}
+
+	if tx.Statement.SQL.String() != "" && strings.HasPrefix(strings.ToUpper(tx.Statement.SQL.String()), "UPDATE") {
+		return "UPDATE"
+	}
+
+	if tx.Statement.SQL.String() != "" && strings.HasPrefix(strings.ToUpper(tx.Statement.SQL.String()), "DELETE") {
+		return "DELETE"
+	}
 	switch tx.Statement.ReflectValue.Kind() {
 	case reflect.Slice, reflect.Array:
 		if tx.Statement.Changed() {
-			return "BulkUpdate"
+			return "UPDATE"
 		}
-		return "BulkCreate"
+		return "INSERT"
 	default:
 		if tx.Statement.Changed() {
-			return "Update"
+			return "UPDATE"
 		}
-		return "Create"
 	}
+
+	// Check for delete operation
+	if tx.Statement.SQL.String() != "" && strings.HasPrefix(strings.ToUpper(tx.Statement.SQL.String()), "DELETE") {
+		return "DELETE"
+	}
+
+	// If it's a new record, it's an insert
+	if tx.Statement.Schema.PrioritizedPrimaryField != nil {
+		_, isZero := tx.Statement.Schema.PrioritizedPrimaryField.ValueOf(tx.Statement.Context, tx.Statement.ReflectValue)
+		if isZero {
+			return "INSERT"
+		}
+	}
+
+	// Default to UPDATE if we can't determine otherwise
+	return "UPDATE"
 }
 
-func getChangedBy(tx *gorm.DB) string {
-	if changedBy, ok := tx.Get("changed_by"); ok {
-		return changedBy.(string)
+func getPerformedBy(tx *gorm.DB) string {
+	value, ok := tx.Get("performed_by")
+	if ok {
+		return value.(string)
+	}
+	if PerformedBy, ok := tx.Get("performed_by"); ok {
+		return PerformedBy.(string)
 	}
 	return "system"
 }
@@ -289,12 +289,7 @@ func (al *AuditLogger) GetTrackedTables() []string {
 	return tables
 }
 
-// SetChangedBy sets the changed_by value for the current transaction
-func (al *AuditLogger) SetChangedBy(tx *gorm.DB, changedBy string) *gorm.DB {
-	if al.DBType == "mysql" {
-		return tx.Exec("SET @changed_by = ?", changedBy)
-	} else if al.DBType == "postgres" {
-		return tx.Exec("SET LOCAL audit.changed_by = ?", changedBy)
-	}
-	return tx
+// SetPerformedBy sets the performed_by value for the current transaction
+func (al *AuditLogger) SetPerformedBy(tx *gorm.DB, performedBy string) *gorm.DB {
+	return tx.Set("performed_by", performedBy)
 }
