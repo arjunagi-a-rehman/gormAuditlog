@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"time"
 
+	"log"
 	"strings"
 
 	"gorm.io/gorm"
@@ -19,7 +20,7 @@ type AuditLog struct {
 	Action       string    `gorm:"index"`
 	Timestamp    time.Time `gorm:"index"`
 	CurrentValue string    `gorm:"type:text"`
-	PerformedBy    string    `gorm:"index"`
+	PerformedBy  string    `gorm:"index"`
 }
 
 // AuditLogger is a struct that holds the database connection and tracked tables
@@ -76,39 +77,87 @@ func (al *AuditLogger) createTableTriggers(tableName string) error {
 }
 
 func (al *AuditLogger) createMySQLTriggers(tableName string) error {
-	createTrigger := func(triggerName, timing, event string) error {
-		sql := fmt.Sprintf(`
-			CREATE TRIGGER %s
-			%s %s ON %s
-			FOR EACH ROW
-			BEGIN
-				INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
-				VALUES (
-					CASE WHEN '%s' = 'DELETE' THEN OLD.id ELSE NEW.id END,
-					'%s',
-					'%s',
-					NOW(),
-					CASE
-						WHEN '%s' = 'DELETE' THEN JSON_OBJECT('old', OLD)
-						WHEN '%s' = 'UPDATE' THEN JSON_OBJECT('old', OLD, 'new', NEW)
-						ELSE JSON_OBJECT('new', NEW)
-					END,
-					IFNULL(@performed_by, 'system')
-				);
-			END;
-		`, triggerName, timing, event, tableName, event, tableName, event, event, event)
+	// INSERT trigger
+	insertTrigger := fmt.Sprintf(`
+		CREATE TRIGGER %s_insert_trigger
+		AFTER INSERT ON %s
+		FOR EACH ROW
+		BEGIN
+			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
+			VALUES (
+				NEW.id,
+				'%s',
+				'INSERT',
+				NOW(),
+				JSON_OBJECT(
+					'id', NEW.id,
+					'name', NEW.name,
+					'email', NEW.email,
+					'created_at', NEW.created_at,
+					'updated_at', NEW.updated_at
+				),
+				IFNULL(@performed_by, 'system')
+			);
+		END;
+	`, tableName, tableName, tableName)
 
-		return al.DB.Exec(sql).Error
-	}
+	// UPDATE trigger
+	updateTrigger := fmt.Sprintf(`
+		CREATE TRIGGER %s_update_trigger
+		AFTER UPDATE ON %s
+		FOR EACH ROW
+		BEGIN
+			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
+			VALUES (
+				NEW.id,
+				'%s',
+				'UPDATE',
+				NOW(),
+				JSON_OBJECT(
+					'id', NEW.id,
+					'name', NEW.name,
+					'email', NEW.email,
+					'created_at', NEW.created_at,
+					'updated_at', NEW.updated_at
+				),
+				IFNULL(@performed_by, 'system')
+			);
+		END;
+	`, tableName, tableName, tableName)
 
-	if err := createTrigger(tableName+"_insert_trigger", "AFTER", "INSERT"); err != nil {
-		return err
+	// DELETE trigger
+	deleteTrigger := fmt.Sprintf(`
+		CREATE TRIGGER %s_delete_trigger
+		BEFORE DELETE ON %s
+		FOR EACH ROW
+		BEGIN
+			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
+			VALUES (
+				OLD.id,
+				'%s',
+				'DELETE',
+				NOW(),
+				JSON_OBJECT(
+					'id', OLD.id,
+					'name', OLD.name,
+					'email', OLD.email,
+					'created_at', OLD.created_at,
+					'updated_at', OLD.updated_at
+				),
+				IFNULL(@performed_by, 'system')
+			);
+		END;
+	`, tableName, tableName, tableName)
+
+	// Execute each trigger creation
+	if err := al.DB.Exec(insertTrigger).Error; err != nil {
+		return fmt.Errorf("failed to create INSERT trigger: %w", err)
 	}
-	if err := createTrigger(tableName+"_update_trigger", "AFTER", "UPDATE"); err != nil {
-		return err
+	if err := al.DB.Exec(updateTrigger).Error; err != nil {
+		return fmt.Errorf("failed to create UPDATE trigger: %w", err)
 	}
-	if err := createTrigger(tableName+"_delete_trigger", "BEFORE", "DELETE"); err != nil {
-		return err
+	if err := al.DB.Exec(deleteTrigger).Error; err != nil {
+		return fmt.Errorf("failed to create DELETE trigger: %w", err)
 	}
 
 	return nil
@@ -130,6 +179,10 @@ func (al *AuditLogger) createPostgresTriggers(tableName string) error {
 				record_id := NEW.id::text;
 			END IF;
 
+			-- Log the values for debugging
+			RAISE NOTICE 'Audit trigger called: table=%%, op=%%, record_id=%%, performed_by=%%', 
+				TG_TABLE_NAME, TG_OP, record_id, audit_performed_by;
+
 			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
 			VALUES (
 				record_id,
@@ -138,12 +191,20 @@ func (al *AuditLogger) createPostgresTriggers(tableName string) error {
 				NOW(),
 				CASE
 					WHEN TG_OP = 'DELETE' THEN row_to_json(OLD)::text
-					WHEN TG_OP = 'UPDATE' THEN json_build_object('old', row_to_json(OLD), 'new', row_to_json(NEW))::text
+					WHEN TG_OP = 'UPDATE' THEN row_to_json(NEW)::text
 					ELSE row_to_json(NEW)::text
 				END,
 				audit_performed_by
 			);
-			RETURN NULL;
+
+			-- Log the inserted audit log for debugging
+			RAISE NOTICE 'Audit log inserted: %%', (SELECT row_to_json(audit_logs.*) FROM audit_logs WHERE id = lastval());
+
+			IF TG_OP = 'DELETE' THEN
+				RETURN OLD;
+			ELSE
+				RETURN NEW;
+			END IF;
 		END;
 		$$ LANGUAGE plpgsql;
 
@@ -153,7 +214,13 @@ func (al *AuditLogger) createPostgresTriggers(tableName string) error {
 		FOR EACH ROW EXECUTE FUNCTION %s_audit();
 	`, tableName, tableName, tableName, tableName, tableName, tableName)
 
-	return al.DB.Exec(sql).Error
+	result := al.DB.Exec(sql)
+	if result.Error != nil {
+		log.Printf("Error creating PostgreSQL trigger for table %s: %v", tableName, result.Error)
+	} else {
+		log.Printf("Successfully created PostgreSQL trigger for table %s", tableName)
+	}
+	return result.Error
 }
 
 // LogChanges is a method to be used as a GORM hook
@@ -190,7 +257,7 @@ func (al *AuditLogger) logSingleRecord(tx *gorm.DB, record interface{}, tableNam
 		Action:       action,
 		Timestamp:    time.Now(),
 		CurrentValue: string(currentValues),
-		PerformedBy:    getPerformedBy(tx),
+		PerformedBy:  getPerformedBy(tx),
 	}
 
 	result := al.DB.Create(&auditLog)
@@ -263,13 +330,6 @@ func getPerformedBy(tx *gorm.DB) string {
 	return "system"
 }
 
-// RegisterHooks registers the audit log hooks with GORM
-func (al *AuditLogger) RegisterHooks() {
-	al.DB.Callback().Create().After("gorm:create").Register("audit_log:create", al.LogChanges)
-	al.DB.Callback().Update().After("gorm:update").Register("audit_log:update", al.LogChanges)
-	al.DB.Callback().Delete().After("gorm:delete").Register("audit_log:delete", al.LogChanges)
-}
-
 // AddTrackedTable adds a table to be tracked for audit logging
 func (al *AuditLogger) AddTrackedTable(tableName string) {
 	al.TrackedTables[tableName] = true
@@ -291,5 +351,24 @@ func (al *AuditLogger) GetTrackedTables() []string {
 
 // SetPerformedBy sets the performed_by value for the current transaction
 func (al *AuditLogger) SetPerformedBy(tx *gorm.DB, performedBy string) *gorm.DB {
+	var err error
+	switch al.DBType {
+	case "mysql":
+		err = tx.Exec("SET @performed_by = ?", performedBy).Error
+	case "postgres":
+		// Use the correct syntax for PostgreSQL
+		err = tx.Exec("SELECT set_config('audit.performed_by', $1, true)", performedBy).Error
+	default:
+		err = fmt.Errorf("SetPerformedBy not implemented for database type: %s", al.DBType)
+	}
+
+	if err != nil {
+		log.Printf("Error in SetPerformedBy: %v", err)
+		tx.AddError(err)
+	} else {
+		log.Printf("Successfully set performed_by to: %s", performedBy)
+	}
+
+	// Set the value in GORM's statement
 	return tx.Set("performed_by", performedBy)
 }

@@ -6,7 +6,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"gorm.io/driver/postgres"
+	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
@@ -18,17 +18,17 @@ type TestUser struct {
 	UpdatedAt time.Time
 }
 
-func setupTestDB(t *testing.T) *gorm.DB {
-	dsn := "host=localhost user=zander password=1234 dbname=test port=5432 sslmode=disable TimeZone=UTC"
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	assert.NoError(t, err, "Failed to connect to database")
+func setupMySQLTestDB(t *testing.T) *gorm.DB {
+	dsn := "root:root@tcp(localhost:3306)/test?charset=utf8mb4&parseTime=True&loc=Local"
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	assert.NoError(t, err, "Failed to connect to MySQL database")
 
 	// Test the connection
 	sqlDB, err := db.DB()
 	assert.NoError(t, err, "Failed to get database instance")
 
 	err = sqlDB.Ping()
-	assert.NoError(t, err, "Failed to ping database")
+	assert.NoError(t, err, "Failed to ping MySQL database")
 
 	// Drop existing tables if they exist
 	db.Exec("DROP TABLE IF EXISTS test_users")
@@ -41,8 +41,8 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-func TestAuditLogger(t *testing.T) {
-	db := setupTestDB(t)
+func TestMySQLAuditLogger(t *testing.T) {
+	db := setupMySQLTestDB(t)
 
 	// Initialize AuditLogger
 	auditLogger, err := NewAuditLogger(db, []string{"test_users"})
@@ -56,9 +56,6 @@ func TestAuditLogger(t *testing.T) {
 	err = auditLogger.CreateTriggers()
 	assert.NoError(t, err, "Failed to create triggers")
 
-	// Register hooks
-	auditLogger.RegisterHooks()
-
 	// Test Create
 	t.Run("Create", func(t *testing.T) {
 		user := TestUser{ID: 1, Name: "John Doe", Email: "john@example.com"}
@@ -68,7 +65,7 @@ func TestAuditLogger(t *testing.T) {
 
 		var auditLog AuditLog
 		recordId := fmt.Sprintf("%v", user.ID)
-		err := db.Where("table_name = ? AND action = ?  AND record_id = ?", "test_users", "INSERT", recordId).First(&auditLog).Error
+		err := db.Where("table_name = ? AND action = ? AND record_id = ?", "test_users", "INSERT", recordId).First(&auditLog).Error
 		fmt.Println(auditLog, "auditLog")
 		assert.NoError(t, err, "Failed to find audit log for create operation")
 		assert.Equal(t, "INSERT", auditLog.Action, "Audit log action should be INSERT")
@@ -122,12 +119,12 @@ func TestAuditLogger(t *testing.T) {
 		recordId := fmt.Sprintf("%v", user.ID)
 
 		err := db.Where("table_name = ? AND action = ? AND record_id = ? AND performed_by = ?", "test_users", "INSERT", recordId, "admin").First(&auditLog).Error
-		fmt.Println(auditLog.PerformedBy, "auditLog.chnageBy")
+		fmt.Println(auditLog.PerformedBy, "auditLog.performedBy")
 		assert.NoError(t, err, "Failed to find audit log for SetPerformedBy operation")
 		assert.Equal(t, "admin", auditLog.PerformedBy, "PerformedBy should be set to admin")
 	})
 
 	// Clean up
-	db.Exec("DROP TABLE IF EXISTS test_users")
-	db.Exec("DROP TABLE IF EXISTS audit_logs")
+	// db.Exec("DROP TABLE IF EXISTS test_users")
+	// db.Exec("DROP TABLE IF EXISTS audit_logs")
 }
