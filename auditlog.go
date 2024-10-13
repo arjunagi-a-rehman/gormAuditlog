@@ -77,6 +77,22 @@ func (al *AuditLogger) createTableTriggers(tableName string) error {
 }
 
 func (al *AuditLogger) createMySQLTriggers(tableName string) error {
+	// Get table columns
+	var columns []struct {
+		Field string
+	}
+	err := al.DB.Raw("SHOW COLUMNS FROM " + tableName).Scan(&columns).Error
+	if err != nil {
+		return fmt.Errorf("failed to get columns for table %s: %w", tableName, err)
+	}
+
+	// Generate JSON_OBJECT string for columns
+	jsonObjectParts := make([]string, len(columns))
+	for i, col := range columns {
+		jsonObjectParts[i] = fmt.Sprintf("'%s', NEW.%s", col.Field, col.Field)
+	}
+	jsonObjectStr := strings.Join(jsonObjectParts, ", ")
+
 	// INSERT trigger
 	insertTrigger := fmt.Sprintf(`
 		CREATE TRIGGER %s_insert_trigger
@@ -85,21 +101,15 @@ func (al *AuditLogger) createMySQLTriggers(tableName string) error {
 		BEGIN
 			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
 			VALUES (
-				NEW.id,
+				CAST(NEW.id AS CHAR),
 				'%s',
 				'INSERT',
 				NOW(),
-				JSON_OBJECT(
-					'id', NEW.id,
-					'name', NEW.name,
-					'email', NEW.email,
-					'created_at', NEW.created_at,
-					'updated_at', NEW.updated_at
-				),
+				JSON_OBJECT(%s),
 				IFNULL(@performed_by, 'system')
 			);
 		END;
-	`, tableName, tableName, tableName)
+	`, tableName, tableName, tableName, jsonObjectStr)
 
 	// UPDATE trigger
 	updateTrigger := fmt.Sprintf(`
@@ -109,21 +119,15 @@ func (al *AuditLogger) createMySQLTriggers(tableName string) error {
 		BEGIN
 			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
 			VALUES (
-				NEW.id,
+				CAST(NEW.id AS CHAR),
 				'%s',
 				'UPDATE',
 				NOW(),
-				JSON_OBJECT(
-					'id', NEW.id,
-					'name', NEW.name,
-					'email', NEW.email,
-					'created_at', NEW.created_at,
-					'updated_at', NEW.updated_at
-				),
+				JSON_OBJECT(%s),
 				IFNULL(@performed_by, 'system')
 			);
 		END;
-	`, tableName, tableName, tableName)
+	`, tableName, tableName, tableName, jsonObjectStr)
 
 	// DELETE trigger
 	deleteTrigger := fmt.Sprintf(`
@@ -133,21 +137,15 @@ func (al *AuditLogger) createMySQLTriggers(tableName string) error {
 		BEGIN
 			INSERT INTO audit_logs (record_id, table_name, action, timestamp, current_value, performed_by)
 			VALUES (
-				OLD.id,
+				CAST(OLD.id AS CHAR),
 				'%s',
 				'DELETE',
 				NOW(),
-				JSON_OBJECT(
-					'id', OLD.id,
-					'name', OLD.name,
-					'email', OLD.email,
-					'created_at', OLD.created_at,
-					'updated_at', OLD.updated_at
-				),
+				JSON_OBJECT(%s),
 				IFNULL(@performed_by, 'system')
 			);
 		END;
-	`, tableName, tableName, tableName)
+	`, tableName, tableName, tableName, strings.ReplaceAll(jsonObjectStr, "NEW.", "OLD."))
 
 	// Execute each trigger creation
 	if err := al.DB.Exec(insertTrigger).Error; err != nil {
