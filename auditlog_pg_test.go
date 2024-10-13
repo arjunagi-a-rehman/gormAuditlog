@@ -36,7 +36,7 @@ func TestAuditLogger(t *testing.T) {
 	db := setupTestDB(t)
 
 	// Initialize AuditLogger
-	auditLogger, err := NewAuditLogger(db, []string{"test_users"})
+	auditLogger, err := NewAuditLogger(db, &TestUser{})
 	assert.NoError(t, err, "Failed to create Audit Logger")
 
 	// Create audit log table
@@ -138,6 +138,6 @@ func TestAuditLogger(t *testing.T) {
 	})
 
 	// Clean up
-	 db.Exec("DROP TABLE IF EXISTS test_users")
-	 db.Exec("DROP TABLE IF EXISTS audit_logs")
+	db.Exec("DROP TABLE IF EXISTS test_users")
+	db.Exec("DROP TABLE IF EXISTS audit_logs")
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // AuditLog represents the structure of our audit log
@@ -31,10 +32,26 @@ type AuditLogger struct {
 }
 
 // NewAuditLogger creates a new AuditLogger
-func NewAuditLogger(db *gorm.DB, tables []string) (*AuditLogger, error) {
+func NewAuditLogger(db *gorm.DB, models ...interface{}) (*AuditLogger, error) {
 	trackedTables := make(map[string]bool)
-	for _, table := range tables {
-		trackedTables[table] = true
+
+	// Get the schema naming strategy
+	namer := schema.NamingStrategy{}
+
+	for _, model := range models {
+		// Get the type of the model
+		modelType := reflect.TypeOf(model)
+
+		// If it's a pointer, get the element type
+		if modelType.Kind() == reflect.Ptr {
+			modelType = modelType.Elem()
+		}
+
+		// Get the table name for the model
+		tableName := namer.TableName(modelType.Name())
+
+		// Add the table name to the tracked tables
+		trackedTables[tableName] = true
 	}
 
 	dbType := ""

@@ -45,7 +45,7 @@ func TestMySQLAuditLogger(t *testing.T) {
 	db := setupMySQLTestDB(t)
 
 	// Initialize AuditLogger
-	auditLogger, err := NewAuditLogger(db, []string{"test_users"})
+	auditLogger, err := NewAuditLogger(db, &TestUser{})
 	assert.NoError(t, err, "Failed to create AuditLogger")
 
 	// Create audit log table
