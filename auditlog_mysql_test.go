@@ -125,6 +125,6 @@ func TestMySQLAuditLogger(t *testing.T) {
 	})
 
 	// Clean up
-	// db.Exec("DROP TABLE IF EXISTS test_users")
-	// db.Exec("DROP TABLE IF EXISTS audit_logs")
+	db.Exec("DROP TABLE IF EXISTS test_users")
+	db.Exec("DROP TABLE IF EXISTS audit_logs")
 }
